@@ -95,7 +95,7 @@ jobs:
       #    upstream source at every build, so its provenance is always clear.
       # -----------------------------------------------------------------------
       - name: Check out AlphaFold 3 (${{ inputs.af3_version }})
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: google-deepmind/alphafold3
           ref: ${{ inputs.af3_version }}
