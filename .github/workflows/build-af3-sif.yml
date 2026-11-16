@@ -1,0 +1,221 @@
+# =============================================================================
+#  Build an Apptainer image (.sif) of AlphaFold 3
+# -----------------------------------------------------------------------------
+#  What this workflow does, in short:
+#    1. downloads the OFFICIAL AlphaFold 3 source code
+#       (google-deepmind/alphafold3) at the selected release
+#    2. builds the Docker image using the official, unmodified Dockerfile
+#    3. converts it into a .sif file for Apptainer (the container runtime
+#       used on the HPC cluster)
+#    4. runs a quick smoke test to check that the container works
+#    5. pushes the .sif to the GitHub Container Registry (ghcr.io), from which
+#       the cluster can fetch it with "apptainer pull"
+#
+#  The container holds the SOFTWARE ONLY: neither the model parameters
+#  (granted personally by Google DeepMind and not redistributable) nor the
+#  genetic databases are included. Both stay on the cluster and are
+#  bind-mounted at run time.
+# =============================================================================
+
+name: Build AlphaFold 3 (Apptainer .sif)
+
+# -----------------------------------------------------------------------------
+#  TRIGGER: manual only (Actions tab → "Run workflow"), choosing the
+#  AlphaFold 3 release to build. It does not run on every push.
+# -----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      af3_version:
+        description: "AlphaFold 3 release (git tag) to build, e.g. v3.0.5"
+        required: true
+        default: "v3.0.5"
+
+# -----------------------------------------------------------------------------
+#  PERMISSIONS granted to the job's automatic token (GITHUB_TOKEN):
+#    - contents: read   → may only read this repository, not modify it
+#    - packages: write  → may push the image to ghcr.io
+#  Principle of least privilege: nothing else.
+# -----------------------------------------------------------------------------
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Apptainer version used for the conversion (pinned for reproducibility).
+  APPTAINER_VERSION: "1.3.6"
+  # Package name on ghcr.io → ghcr.io/<owner>/alphafold3-sif:<version>
+  PACKAGE_NAME: "alphafold3-sif"
+
+jobs:
+  build:
+    # Virtual machine provided by GitHub: Linux x86_64, the same CPU
+    # architecture as the cluster nodes.
+    runs-on: ubuntu-24.04
+    # Safety limit: the job is cancelled if it hangs.
+    timeout-minutes: 180
+
+    env:
+      # The user input is passed through an environment variable instead of
+      # being pasted directly into shell commands. This is GitHub's
+      # recommended practice to prevent script injection.
+      AF3_VERSION: ${{ inputs.af3_version }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0) Validate the input: only accept versions formatted as vX.Y.Z
+      # -----------------------------------------------------------------------
+      - name: Validate version format
+        run: |
+          if [[ ! "$AF3_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version: '$AF3_VERSION' (expected e.g. v3.0.5)"
+            exit 1
+          fi
+          echo "Building AlphaFold 3 $AF3_VERSION"
+
+      # -----------------------------------------------------------------------
+      # 1) Free up disk space
+      #    The runner ships with only ~14 GB free, not enough for the Docker
+      #    image (~10 GB) + temporary files + the final .sif. We remove
+      #    preinstalled toolchains we do not need (Android SDK, .NET, Haskell,
+      #    CodeQL, cached Docker images). The runner is discarded after the
+      #    job, so this is harmless.
+      # -----------------------------------------------------------------------
+      - name: Free up disk space
+        run: |
+          echo "Disk space BEFORE:"; df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          echo "Disk space AFTER:"; df -h /
+
+      # -----------------------------------------------------------------------
+      # 2) Fetch the official AlphaFold 3 source code at the selected release.
+      #    The code is NOT stored in this repository: it is fetched from the
+      #    upstream source at every build, so its provenance is always clear.
+      # -----------------------------------------------------------------------
+      - name: Check out AlphaFold 3 (${{ inputs.af3_version }})
+        uses: actions/checkout@v4
+        with:
+          repository: google-deepmind/alphafold3
+          ref: ${{ inputs.af3_version }}
+          path: alphafold3
+
+      - name: Record the exact source commit
+        run: |
+          AF3_COMMIT=$(git -C alphafold3 rev-parse HEAD)
+          echo "AF3_COMMIT=$AF3_COMMIT" >> "$GITHUB_ENV"
+          echo "AlphaFold 3 commit: $AF3_COMMIT"
+
+      # -----------------------------------------------------------------------
+      # 3) Build the Docker image with the official, unmodified Dockerfile.
+      #    This is the long step (~20-40 min): it installs Python 3.12,
+      #    compiles HMMER (used for the MSA searches) and installs JAX plus
+      #    the CUDA libraries.
+      # -----------------------------------------------------------------------
+      - name: Build Docker image
+        working-directory: alphafold3
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            --tag "alphafold3:${AF3_VERSION}" \
+            --file docker/Dockerfile \
+            .
+          docker image ls alphafold3
+          df -h /
+
+      # -----------------------------------------------------------------------
+      # 4) Install Apptainer on the runner (official .deb package from the
+      #    Apptainer GitHub releases page, pinned version).
+      # -----------------------------------------------------------------------
+      - name: Install Apptainer ${{ env.APPTAINER_VERSION }}
+        run: |
+          wget --quiet \
+            "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb"
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --quiet "./apptainer_${APPTAINER_VERSION}_amd64.deb"
+          apptainer --version
+
+      # -----------------------------------------------------------------------
+      # 5) Convert Docker → .sif
+      #    "docker-daemon://" reads the freshly built image straight from the
+      #    local Docker daemon, with no intermediate registry needed.
+      #    Temporary files go to /mnt (the runner's secondary disk) so that
+      #    the main disk does not fill up.
+      # -----------------------------------------------------------------------
+      - name: Convert to .sif
+        run: |
+          SIF="alphafold3_${AF3_VERSION}.sif"
+          echo "SIF=$SIF" >> "$GITHUB_ENV"
+          sudo mkdir -p /mnt/apptainer_tmp
+          sudo APPTAINER_TMPDIR=/mnt/apptainer_tmp \
+            apptainer build "$SIF" "docker-daemon://alphafold3:${AF3_VERSION}"
+          sudo chown "$(id -u):$(id -g)" "$SIF"
+          ls -lh "$SIF"
+
+      # -----------------------------------------------------------------------
+      # 6) Smoke test (no GPU available on the runner):
+      #    - HMMER (jackhmmer) is installed and responds
+      #    - the alphafold3 Python package can be imported
+      #    - the main entry point run_alphafold.py starts and prints its help
+      #    The real GPU test is done afterwards on the cluster.
+      # -----------------------------------------------------------------------
+      - name: Smoke test the container
+        run: |
+          apptainer exec "$SIF" jackhmmer -h | head -n 3
+          apptainer exec "$SIF" python3 -c "import alphafold3; print('import alphafold3: OK')"
+          apptainer exec "$SIF" python3 /app/alphafold/run_alphafold.py --helpshort | head -n 20
+
+      # -----------------------------------------------------------------------
+      # 7) SHA-256 checksum ("fingerprint") of the file: lets anyone (admins,
+      #    supervisors) verify that the .sif on the cluster is byte-for-byte
+      #    identical to the one built here.
+      # -----------------------------------------------------------------------
+      - name: Compute SHA-256 checksum
+        run: |
+          SHA256=$(sha256sum "$SIF" | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "SHA-256: $SHA256"
+
+      # -----------------------------------------------------------------------
+      # 8) Push to the GitHub Container Registry (ghcr.io) in ORAS format
+      #    (the format Apptainer uses to store .sif files in OCI registries).
+      #    Login uses the job's automatic token: no password is required.
+      # -----------------------------------------------------------------------
+      - name: Push to ghcr.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Image names on ghcr.io must be lowercase
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          DEST="oras://ghcr.io/${OWNER}/${PACKAGE_NAME}:${AF3_VERSION}"
+          echo "DEST=$DEST" >> "$GITHUB_ENV"
+          echo "$GITHUB_TOKEN" | apptainer registry login \
+            --username "$GITHUB_ACTOR" --password-stdin oras://ghcr.io
+          apptainer push "$SIF" "$DEST"
+
+      # -----------------------------------------------------------------------
+      # 9) Build summary on the job page: everything needed to document the
+      #    build (useful for HPC admins, supervisors and reports).
+      # -----------------------------------------------------------------------
+      - name: Build summary
+        run: |
+          SIZE=$(du -h "$SIF" | cut -f1)
+          {
+            echo "## AlphaFold 3 ${AF3_VERSION} — Apptainer image"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| AlphaFold 3 release | \`${AF3_VERSION}\` |"
+            echo "| Source commit | \`${AF3_COMMIT}\` |"
+            echo "| Apptainer version used for the build | \`${APPTAINER_VERSION}\` |"
+            echo "| .sif size | ${SIZE} |"
+            echo "| SHA-256 | \`${SHA256}\` |"
+            echo ""
+            echo "### Download on the cluster"
+            echo '```bash'
+            echo "apptainer pull ${SIF} ${DEST}"
+            echo "sha256sum ${SIF}   # must match the SHA-256 above"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

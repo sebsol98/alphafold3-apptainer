@@ -1,0 +1,5 @@
+# Container images and model parameters must never be committed
+*.sif
+*.bin
+*.bin.zst
+.DS_Store
